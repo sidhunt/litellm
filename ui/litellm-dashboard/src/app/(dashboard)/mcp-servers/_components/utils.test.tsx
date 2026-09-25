@@ -3,10 +3,39 @@ import {
   extractMCPToken,
   maskUrl,
   getMaskedAndFullUrl,
+  getMCPNetworkAccess,
   validateMCPServerUrl,
   validateMCPServerName,
   normalizeToolOverrideMap,
 } from "./utils";
+
+describe("getMCPNetworkAccess", () => {
+  it.each([
+    { publicIp: true, explicit: false, label: "All networks" },
+    { publicIp: false, explicit: true, label: "All networks" },
+    { publicIp: true, explicit: true, label: "All networks" },
+    { publicIp: false, explicit: false, label: "Internal only" },
+    { publicIp: true, explicit: undefined, label: "All networks" },
+    { publicIp: false, explicit: undefined, label: "Unknown" },
+    { publicIp: undefined, explicit: false, label: "Unknown" },
+  ])("reports $label for network=$publicIp and publication=$explicit", ({ publicIp, explicit, label }) => {
+    expect(
+      getMCPNetworkAccess({
+        available_on_public_internet: publicIp,
+        mcp_info: { server_name: "demo", is_public: true, is_public_explicit: explicit },
+      }).label,
+    ).toBe(label);
+  });
+
+  it("explains when hub publication permits public IPs", () => {
+    expect(
+      getMCPNetworkAccess({
+        available_on_public_internet: false,
+        mcp_info: { server_name: "demo", is_public_explicit: true },
+      }).description,
+    ).toContain("because this server is published in MCP Hub");
+  });
+});
 
 describe("extractMCPToken", () => {
   it("should extract token after /mcp/", () => {
