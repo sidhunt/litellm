@@ -1,12 +1,41 @@
 use std::time::Duration;
 
 use litellm_llms::{
-    anthropic::common_utils::AnthropicModelCapabilities,
+    anthropic::{
+        common_utils::AnthropicModelCapabilities,
+        experimental_pass_through::messages::transformation::ANTHROPIC_MESSAGES_CONFIG,
+    },
+    azure_ai::anthropic::messages_transformation::AZURE_ANTHROPIC_MESSAGES_CONFIG,
     base_llm::anthropic_messages::transformation::BaseAnthropicMessagesConfig,
 };
 use litellm_types::utils::ProviderSpecificHeaders;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use strum::{EnumString, IntoStaticStr};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, EnumString, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum MessagesProvider {
+    Anthropic,
+    AzureAi,
+}
+
+impl MessagesProvider {
+    pub fn name(self) -> &'static str {
+        self.into()
+    }
+
+    pub(super) fn config(self) -> &'static dyn BaseAnthropicMessagesConfig {
+        match self {
+            Self::Anthropic => &ANTHROPIC_MESSAGES_CONFIG,
+            Self::AzureAi => &AZURE_ANTHROPIC_MESSAGES_CONFIG,
+        }
+    }
+
+    pub(super) fn streams(self) -> bool {
+        matches!(self, Self::Anthropic)
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MessagesShaping {
@@ -22,7 +51,7 @@ pub struct MessagesShaping {
 
 pub struct MessagesRequest<'a> {
     pub model: &'a str,
-    pub body: Value,
+    pub body: Map<String, Value>,
     pub api_key: Option<&'a str>,
     pub api_base: Option<&'a str>,
     pub custom_llm_provider: Option<&'a str>,
@@ -33,11 +62,12 @@ pub struct MessagesRequest<'a> {
 }
 
 pub struct ProviderMessagesRequest {
-    pub provider: String,
+    pub provider: MessagesProvider,
     pub model: String,
     pub config: &'static dyn BaseAnthropicMessagesConfig,
     pub url: String,
     pub body: Value,
+    pub stream: bool,
     pub upstream_headers: Vec<(String, String)>,
     pub timeout: Option<Duration>,
 }
@@ -49,6 +79,28 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[rstest]
+    #[case::anthropic("anthropic", Some(MessagesProvider::Anthropic))]
+    #[case::azure_ai("azure_ai", Some(MessagesProvider::AzureAi))]
+    #[case::case_sensitive("Anthropic", None)]
+    #[case::unsupported("openai", None)]
+    fn provider_parses_from_its_name(
+        #[case] name: &str,
+        #[case] expected: Option<MessagesProvider>,
+    ) {
+        assert_eq!(name.parse::<MessagesProvider>().ok(), expected);
+        if let Some(provider) = expected {
+            assert_eq!(provider.name(), name);
+        }
+    }
+
+    #[rstest]
+    #[case::anthropic(MessagesProvider::Anthropic, true)]
+    #[case::azure_ai(MessagesProvider::AzureAi, false)]
+    fn only_anthropic_streams(#[case] provider: MessagesProvider, #[case] streams: bool) {
+        assert_eq!(provider.streams(), streams);
+    }
 
     #[rstest]
     #[case::nothing_projected(json!({}), MessagesShaping::default())]

@@ -6,7 +6,7 @@
 
 mod error;
 pub mod types;
-pub use error::Error;
+pub use error::{Error, JsonError};
 mod common_utils;
 mod handler;
 mod prepare;
@@ -17,7 +17,6 @@ use litellm_http::{ClientVariant, HttpClientConfig, HttpClientPool};
 use litellm_secrets::source::EnvironmentSecrets;
 use litellm_types::llms::anthropic_messages::anthropic_response::AnthropicMessagesResponse;
 use route::{LocalMessagesHost, MessagesCall, MessagesOutput, messages_machine};
-use serde_json::Value;
 
 use crate::messages::types::MessagesRequest;
 
@@ -26,14 +25,9 @@ pub async fn messages(
     config: &HttpClientConfig,
     request: MessagesRequest<'_>,
 ) -> Result<AnthropicMessagesResponse, Error> {
-    let Value::Object(body) = request.body else {
-        return Err(Error::InvalidRequest(
-            "messages body must be an object".into(),
-        ));
-    };
     let call = MessagesCall {
         model: request.model.into(),
-        body,
+        body: request.body,
         api_key: request.api_key.map(Into::into),
         api_base: request.api_base.map(Into::into),
         custom_llm_provider: request.custom_llm_provider.map(Into::into),

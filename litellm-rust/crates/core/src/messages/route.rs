@@ -18,6 +18,7 @@ use litellm_types::{
     llms::anthropic_messages::anthropic_response::AnthropicMessagesResponse,
     utils::ProviderSpecificHeaders,
 };
+use reqwest::header::HeaderMap;
 use serde_json::{Map, Value};
 
 use super::{
@@ -26,7 +27,6 @@ use super::{
     prepare::{prepare_provider_request, resolve_provider},
     types::{MessagesRequest, MessagesShaping},
 };
-use crate::constants::ANTHROPIC_MESSAGES_PROVIDER;
 
 pub const BODY_FIELDS: [&str; 23] = [
     "messages",
@@ -81,7 +81,7 @@ pub enum MessagesOutput {
 
 /// The upstream response as the caller sees it at stream hand-off, before any chunk.
 pub struct MessagesStreamHead {
-    pub headers: Vec<(String, String)>,
+    pub headers: HeaderMap,
 }
 
 pub struct Messages;
@@ -118,7 +118,7 @@ impl Host<Messages> for LocalMessagesHost {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
-            .ok_or_else(|| Error::InvalidRequest("messages request was already projected".into()))
+            .ok_or(Error::AlreadyProjected)
     }
 
     async fn open(&self, _: MessagesStreamHead) -> Result<Demand, Error> {
@@ -154,7 +154,7 @@ async fn execute(
     let params = host
         .pre_request(PublicRequest {
             model: call.model.clone(),
-            custom_llm_provider: resolved.provider.to_string(),
+            custom_llm_provider: resolved.provider.name().to_owned(),
             messages: call.body.get("messages").cloned().unwrap_or(Value::Null),
             params: call
                 .body
@@ -177,7 +177,7 @@ async fn execute(
         let request = prepare_provider_request(
             MessagesRequest {
                 model: &call.model,
-                body: Value::Object(body.clone()),
+                body: body.clone(),
                 api_key: call.api_key.as_deref(),
                 api_base: call.api_base.as_deref(),
                 custom_llm_provider: call.custom_llm_provider.as_deref(),
@@ -189,13 +189,12 @@ async fn execute(
             resolved,
             secrets.as_ref(),
         )?;
-        let stream = request.body.get("stream").and_then(Value::as_bool) == Some(true);
-        if stream && request.provider != ANTHROPIC_MESSAGES_PROVIDER {
+        if request.stream && !request.provider.streams() {
             return Err(Error::Unsupported("streaming messages for this provider"));
         }
         let context = RequestContext {
             model: request.model.clone(),
-            custom_llm_provider: request.provider.clone(),
+            custom_llm_provider: request.provider.name().to_owned(),
             optional_params: Value::Object(
                 request
                     .body
@@ -224,7 +223,7 @@ async fn execute(
             let error = provider_error(response).await;
             if !recovered_thinking
                 && let Some(recovered) =
-                    super::handler::recover_thinking(&error, &request.provider, &wire.body)?
+                    super::handler::recover_thinking(&error, request.provider, &wire.body)?
             {
                 body = recovered;
                 recovered_thinking = true;
@@ -232,7 +231,7 @@ async fn execute(
             }
             return Err(error);
         }
-        if stream {
+        if request.stream {
             return relay(&host, response).await;
         }
         let text = response.text().await.map_err(network)?;
@@ -274,11 +273,7 @@ async fn relay(
     mut response: reqwest::Response,
 ) -> Result<MessagesOutput, Error> {
     let head = MessagesStreamHead {
-        headers: response
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| Some((name.to_string(), value.to_str().ok()?.to_string())))
-            .collect(),
+        headers: response.headers().clone(),
     };
     if host.open(head).await? == Demand::Detached {
         return Ok(MessagesOutput::Streamed);

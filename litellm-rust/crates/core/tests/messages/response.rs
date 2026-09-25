@@ -20,7 +20,10 @@ async fn the_provider_message_is_returned(call: MessagesCall, #[case] provider: 
     .await;
 
     assert_eq!(message.id, "msg_1");
-    assert_eq!(message.content, [json!({"type": "text", "text": "hi"})]);
+    assert_eq!(
+        serde_json::to_value(&message.content).unwrap(),
+        json!([{"type": "text", "text": "hi"}])
+    );
     assert_eq!(message.stop_reason.as_deref(), Some("end_turn"));
 }
 
@@ -224,6 +227,63 @@ async fn an_unreadable_success_body_is_an_invalid_response(
     .expect("an unreadable body fails");
 
     assert!(error.is_response(), "{error:?}");
+    assert!(!matches!(error, Error::InvalidRequest(_)), "{error:?}");
+}
+
+#[rstest]
+#[tokio::test]
+async fn a_body_that_is_not_json_is_a_response_decoding_error(call: MessagesCall) {
+    let upstream = upstream([ResponseTemplate::new(200).set_body_string("not json")]).await;
+
+    let error = run(MessagesCall {
+        api_key: Some("sk".into()),
+        api_base: Some(upstream.uri()),
+        ..call
+    })
+    .await
+    .err()
+    .expect("an unreadable body fails");
+
+    assert!(matches!(error, Error::ResponseDecoding(_)), "{error:?}");
+    assert!(
+        error
+            .to_string()
+            .starts_with("invalid messages response JSON: "),
+        "{error}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn unrecognized_content_and_null_usage_counters_pass_through(call: MessagesCall) {
+    let content = json!([
+        {"type": "text", "text": null},
+        "stray",
+        {"type": "web_search_tool_result", "tool_use_id": "s1", "content": []}
+    ]);
+    let usage = json!({"input_tokens": 1, "output_tokens": 2, "cache_creation_input_tokens": null});
+    let body = Value::Object(
+        object(message_body())
+            .into_iter()
+            .chain(object(json!({"content": content, "usage": usage})))
+            .collect(),
+    );
+    let upstream = upstream([json_response(body)]).await;
+
+    let message = run(MessagesCall {
+        api_key: Some("sk".into()),
+        api_base: Some(upstream.uri()),
+        ..call
+    })
+    .await
+    .expect("the message decodes");
+
+    let MessagesOutput::Message(message) = message else {
+        panic!("a non-streaming call returned a stream");
+    };
+    let round_tripped = serde_json::to_value(&*message).unwrap();
+    assert_eq!(round_tripped["content"], content);
+    assert_eq!(round_tripped["usage"], usage);
 }
 
 #[rstest]
@@ -247,7 +307,7 @@ async fn a_provider_slower_than_the_timeout_fails_the_call(call: MessagesCall) {
 fn facade_request(body: Value, api_base: &str) -> MessagesRequest<'_> {
     MessagesRequest {
         model: MODEL,
-        body,
+        body: object(body),
         api_key: Some("sk-ant"),
         api_base: Some(api_base),
         custom_llm_provider: Some("anthropic"),
@@ -284,21 +344,6 @@ async fn the_facade_sends_through_the_injected_http_pool_configuration() {
     assert_eq!(sent.header("user-agent"), Some("host-owned/1"));
 }
 
-#[tokio::test]
-async fn the_facade_rejects_a_body_that_is_not_an_object() {
-    let error = messages(
-        &http_pool(),
-        &http_config(),
-        facade_request(json!([]), UNREACHABLE_BASE),
-    )
-    .await
-    .expect_err("a non-object body is rejected");
-
-    assert_eq!(
-        error,
-        Error::InvalidRequest("messages body must be an object".into())
-    );
-}
 
 #[rstest]
 #[case::unrelated_bad_request(400, "invalid tool signature", 1)]

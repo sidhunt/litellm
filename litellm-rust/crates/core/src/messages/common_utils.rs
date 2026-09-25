@@ -1,25 +1,11 @@
 use litellm_http::request::string_headers as shared_string_headers;
 pub(super) use litellm_http::request::truncate_error_body;
-use litellm_llms::{
-    anthropic::messages::transformation::ANTHROPIC_MESSAGES_CONFIG,
-    azure_ai::anthropic::messages_transformation::AZURE_ANTHROPIC_MESSAGES_CONFIG,
-    base_llm::anthropic_messages::transformation::BaseAnthropicMessagesConfig,
-};
+
 use serde_json::{Map, Value};
 
 use super::Error;
 
 const HEADER_CONTEXT: &str = "messages";
-
-pub(super) fn messages_provider_config(
-    provider: &str,
-) -> Option<&'static dyn BaseAnthropicMessagesConfig> {
-    match provider {
-        "anthropic" => Some(&ANTHROPIC_MESSAGES_CONFIG),
-        "azure_ai" => Some(&AZURE_ANTHROPIC_MESSAGES_CONFIG),
-        _ => None,
-    }
-}
 
 pub(super) fn string_headers(
     extra_headers: Option<Map<String, Value>>,
@@ -31,15 +17,8 @@ pub(super) fn string_headers(
 mod tests {
     use serde_json::json;
 
-    use super::{messages_provider_config, string_headers, truncate_error_body};
+    use super::{string_headers, truncate_error_body};
     use crate::messages::Error;
-
-    #[test]
-    fn provider_config_resolves_anthropic_and_azure_ai() {
-        assert!(messages_provider_config("anthropic").is_some());
-        assert!(messages_provider_config("azure_ai").is_some());
-        assert!(messages_provider_config("openai").is_none());
-    }
 
     #[test]
     fn truncate_error_body_caps_long_payloads() {

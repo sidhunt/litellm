@@ -13,15 +13,12 @@ use litellm_llms::{
 use litellm_types::llms::anthropic_messages::anthropic_request::AnthropicMessagesRequest;
 use serde_json::{Map, Value};
 
-use super::{
-    Error,
-    common_utils::{messages_provider_config, string_headers},
-};
-use crate::messages::types::{MessagesRequest, ProviderMessagesRequest};
+use super::{Error, common_utils::string_headers};
+use crate::messages::types::{MessagesProvider, MessagesRequest, ProviderMessagesRequest};
 
 pub(super) struct ResolvedProvider<'a> {
     pub(super) model: &'a str,
-    pub(super) provider: &'a str,
+    pub(super) provider: MessagesProvider,
     pub(super) config: &'static dyn BaseAnthropicMessagesConfig,
 }
 
@@ -44,12 +41,13 @@ pub(super) fn resolve_provider<'a>(
                 "unable to resolve custom_llm_provider for messages request".to_string(),
             )
         })?;
-    let config = messages_provider_config(provider)
-        .ok_or_else(|| Error::InvalidProvider(provider.to_string()))?;
+    let provider = provider
+        .parse::<MessagesProvider>()
+        .map_err(|_| Error::InvalidProvider(provider.to_string()))?;
     Ok(ResolvedProvider {
         model,
         provider,
-        config,
+        config: provider.config(),
     })
 }
 
@@ -67,7 +65,8 @@ pub(super) fn prepare_provider_request(
     let env_lookup = |key: &str| secrets.get(key);
 
     let typed_request: AnthropicMessagesRequest =
-        serde_json::from_value(request.body).map_err(invalid_request)?;
+        serde_json::from_value(Value::Object(request.body))
+            .map_err(|e| Error::RequestDecoding(e.into()))?;
     let sanitized = shape_anthropic_messages_request(
         AnthropicMessagesRequest {
             model: model.clone(),
@@ -82,7 +81,8 @@ pub(super) fn prepare_provider_request(
         &MessagesTransformContext::new(request.shaping.capabilities, request.shaping.drop_params),
     )?;
 
-    let scoped = get_provider_specific_headers(request.provider_specific_header.as_ref(), provider);
+    let scoped =
+        get_provider_specific_headers(request.provider_specific_header.as_ref(), provider.name());
     let forwarded = string_headers(Some(
         request
             .extra_headers
@@ -97,27 +97,21 @@ pub(super) fn prepare_provider_request(
         &transformed,
     );
 
-    let body = serde_json::to_value(transformed).map_err(|err| {
-        Error::InvalidRequest(format!(
-            "failed to serialize Anthropic messages request: {err}"
-        ))
-    })?;
+    let streams = transformed.stream == Some(true);
+    let body = serde_json::to_value(transformed).map_err(|e| Error::RequestEncoding(e.into()))?;
 
     let url = config.get_complete_url(request.api_base, &model, &env_lookup)?;
 
     Ok(ProviderMessagesRequest {
-        provider: provider.to_string(),
+        provider,
         model,
         config,
         url,
         body,
+        stream: streams,
         upstream_headers: headers,
         timeout: request.timeout,
     })
-}
-
-fn invalid_request(err: serde_json::Error) -> Error {
-    Error::InvalidRequest(format!("invalid Anthropic messages request: {err}"))
 }
 
 fn without_additional_drop_params(
@@ -127,11 +121,10 @@ fn without_additional_drop_params(
     if paths.is_empty() {
         return Ok(request);
     }
-    let Value::Object(fields) = serde_json::to_value(request).map_err(invalid_request)? else {
-        return Err(Error::InvalidRequest(
-            "Anthropic messages request did not serialize to an object".to_string(),
-        ));
-    };
+    let fields = serde_json::from_value::<Map<String, Value>>(
+        serde_json::to_value(request).map_err(|e| Error::RequestEncoding(e.into()))?,
+    )
+    .map_err(|e| Error::RequestDecoding(e.into()))?;
     let (required, optional): (Map<String, Value>, Map<String, Value>) = fields
         .into_iter()
         .partition(|(key, _)| matches!(key.as_str(), "model" | "messages"));
@@ -142,7 +135,7 @@ fn without_additional_drop_params(
         .into_iter()
         .chain(trimmed.as_object().cloned().unwrap_or_default())
         .collect();
-    serde_json::from_value(Value::Object(merged)).map_err(invalid_request)
+    serde_json::from_value(Value::Object(merged)).map_err(|e| Error::RequestDecoding(e.into()))
 }
 
 fn with_default_headers(
@@ -173,6 +166,13 @@ mod tests {
     #[fixture]
     fn shaping() -> MessagesShaping {
         MessagesShaping::default()
+    }
+
+    fn object(value: Value) -> Map<String, Value> {
+        let Value::Object(fields) = value else {
+            unreachable!("test bodies are objects")
+        };
+        fields
     }
 
     fn prepare(request: MessagesRequest<'_>) -> Result<ProviderMessagesRequest, Error> {
@@ -223,7 +223,7 @@ mod tests {
         let prepared = prepare_with_secrets(
             MessagesRequest {
                 model: "claude-test",
-                body: json!({"model": "claude-test", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16}),
+                body: object(json!({"model": "claude-test", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})),
                 api_key: None,
                 api_base: None,
                 custom_llm_provider: Some("anthropic"),
@@ -250,7 +250,7 @@ mod tests {
     fn prepared_body(body: Value, shaping: MessagesShaping) -> Result<Value, Error> {
         prepare(MessagesRequest {
             model: "anthropic/claude-test",
-            body,
+            body: object(body),
             api_key: Some("sk-test"),
             api_base: Some("https://anthropic.test"),
             custom_llm_provider: Some("anthropic"),
@@ -382,7 +382,7 @@ mod tests {
         .unwrap();
         let prepared = prepare(MessagesRequest {
             model,
-            body: json!({"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16}),
+            body: object(json!({"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})),
             api_key: Some("sk-test"),
             api_base: Some("https://resource.services.ai.azure.com"),
             custom_llm_provider,
@@ -482,5 +482,49 @@ mod tests {
                 "metadata.user_id must be a string, got 123".to_string()
             ))
         );
+    }
+
+    #[rstest]
+    #[case::streaming(json!({"stream": true}), true)]
+    #[case::explicitly_off(json!({"stream": false}), false)]
+    #[case::unset(json!({}), false)]
+    fn prepared_request_reports_whether_it_streams(
+        shaping: MessagesShaping,
+        #[case] extra: Value,
+        #[case] expected: bool,
+    ) {
+        let body = [
+            ("model", json!("claude-test")),
+            ("messages", json!([{"role": "user", "content": "hi"}])),
+            ("max_tokens", json!(16)),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .chain(extra.as_object().cloned().unwrap_or_default())
+        .collect();
+        let prepared = prepare(MessagesRequest {
+            model: "claude-test",
+            body,
+            api_key: Some("sk-test"),
+            api_base: Some("https://anthropic.test"),
+            custom_llm_provider: Some("anthropic"),
+            extra_headers: None,
+            provider_specific_header: None,
+            timeout: None,
+            shaping,
+        })
+        .unwrap();
+        assert_eq!(prepared.stream, expected);
+    }
+
+    #[rstest]
+    fn untyped_messages_fail_as_request_decoding(shaping: MessagesShaping) {
+        assert!(matches!(
+            prepared_body(
+                json!({"model": "claude-test", "messages": "nope", "max_tokens": 16}),
+                shaping,
+            ),
+            Err(Error::RequestDecoding(_))
+        ));
     }
 }
