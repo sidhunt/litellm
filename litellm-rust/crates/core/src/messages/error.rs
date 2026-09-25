@@ -4,6 +4,8 @@ use litellm_llms::base_llm::chat::transformation::Error as LlmError;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
+    #[error(transparent)]
+    HostFault(#[from] litellm_host::MachineFault),
     #[error("invalid provider: {0}")]
     InvalidProvider(String),
     #[error("missing required field: {0}")]

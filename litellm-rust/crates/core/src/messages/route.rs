@@ -7,9 +7,9 @@ use std::{
 use bytes::Bytes;
 use litellm_auth::SecretValue;
 use litellm_host::{
-    event::{MachineEvent, RawResponse, RequestContext, WireRequest},
-    host::{Demand, Host},
-    machine::{CallMachine, HostChannel, MachineFault},
+    event::{MachineEvent, PublicRequest, RawResponse, RequestContext, WireRequest},
+    host::{Demand, Host, Verdict},
+    machine::{CallMachine, HostChannel},
     protocol::Protocol,
 };
 use litellm_http::{Client, ClientVariant, HttpClientConfig, HttpClientPool};
@@ -27,6 +27,31 @@ use super::{
     types::{MessagesRequest, MessagesShaping},
 };
 use crate::constants::ANTHROPIC_MESSAGES_PROVIDER;
+
+pub const BODY_FIELDS: [&str; 22] = [
+    "max_tokens",
+    "metadata",
+    "stop_sequences",
+    "stream",
+    "system",
+    "temperature",
+    "thinking",
+    "tool_choice",
+    "tools",
+    "top_k",
+    "inference_geo",
+    "top_p",
+    "mcp_servers",
+    "context_management",
+    "compaction",
+    "container",
+    "output_format",
+    "speed",
+    "output_config",
+    "cache_control",
+    "reasoning_effort",
+    "safeguards",
+];
 
 /// The caller's request as the host projects it.
 pub struct MessagesCall {
@@ -69,15 +94,6 @@ impl Protocol for Messages {
     type StreamHead = MessagesStreamHead;
 }
 
-impl From<MachineFault> for Error {
-    fn from(fault: MachineFault) -> Self {
-        Self::InvalidRequest(match fault {
-            MachineFault::Abandoned => "messages host driver was abandoned".into(),
-            MachineFault::Protocol(message) => format!("messages {message}"),
-        })
-    }
-}
-
 pub type MessagesHost = HostChannel<Messages>;
 pub type MessagesMachine = CallMachine<Messages>;
 
@@ -104,6 +120,12 @@ impl Host<Messages> for LocalMessagesHost {
             .ok_or_else(|| Error::InvalidRequest("messages request was already projected".into()))
     }
 
+    async fn open(&self, _: MessagesStreamHead) -> Result<Demand, Error> {
+        Err(Error::Unsupported(
+            "streamed responses need a streaming host",
+        ))
+    }
+
     async fn custom_op(&self, op: Infallible) -> Result<(), Error> {
         match op {}
     }
@@ -126,67 +148,122 @@ async fn execute(
     secrets: Arc<dyn SecretSource>,
 ) -> Result<MessagesOutput, Error> {
     let call = host.project().await?;
-    let stream = call.streams();
+    let caller_streams = call.streams();
     let resolved = resolve_provider(&call.model, call.custom_llm_provider.as_deref())?;
-    let secrets = secrets.resolve(resolved.config.secret_names()).await?;
-    let request = prepare_provider_request(
-        MessagesRequest {
-            model: &call.model,
-            body: Value::Object(call.body.clone()),
-            api_key: call.api_key.as_deref(),
-            api_base: call.api_base.as_deref(),
-            custom_llm_provider: call.custom_llm_provider.as_deref(),
-            extra_headers: call.extra_headers.clone(),
-            provider_specific_header: call.provider_specific_header.clone(),
-            timeout: call.timeout,
-            shaping: call.shaping.clone(),
-        },
-        resolved,
-        secrets.as_ref(),
-    )?;
-    if stream && request.provider != ANTHROPIC_MESSAGES_PROVIDER {
-        return Err(Error::Unsupported("streaming messages for this provider"));
-    }
-    let context = RequestContext {
-        model: request.model.clone(),
-        custom_llm_provider: request.provider.clone(),
-        optional_params: Value::Object(
-            request
+    let params = host
+        .pre_request(PublicRequest {
+            model: call.model.clone(),
+            custom_llm_provider: resolved.provider.to_string(),
+            messages: call.body.get("messages").cloned().unwrap_or(Value::Null),
+            params: call
                 .body
-                .as_object()
-                .into_iter()
-                .flatten()
+                .iter()
                 .filter(|(name, _)| !matches!(name.as_str(), "model" | "messages"))
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
-        ),
-        secret_fields: Vec::new(),
-        api_key: call.api_key.clone().map(SecretValue::new),
-    };
-    let wire = host
-        .before_send(
-            WireRequest {
-                url: request.url,
-                headers: request.upstream_headers,
-                body: request.body,
-            },
-            context,
-        )
+            fields: &BODY_FIELDS,
+        })
         .await?;
-    let response = send(&http, &wire.url, &wire.headers, &wire.body, request.timeout).await?;
-    if !response.status().is_success() {
-        return Err(provider_error(response).await);
+    let patch = params
+        .into_iter()
+        .filter(|(name, _)| BODY_FIELDS.contains(&name.as_str()))
+        .collect();
+    let mut body = patched(&call.body, patch);
+    let secrets = secrets.resolve(resolved.config.secret_names()).await?;
+    let mut recovered_thinking = false;
+    loop {
+        let resolved = resolve_provider(&call.model, call.custom_llm_provider.as_deref())?;
+        let request = prepare_provider_request(
+            MessagesRequest {
+                model: &call.model,
+                body: Value::Object(body.clone()),
+                api_key: call.api_key.as_deref(),
+                api_base: call.api_base.as_deref(),
+                custom_llm_provider: call.custom_llm_provider.as_deref(),
+                extra_headers: call.extra_headers.clone(),
+                provider_specific_header: call.provider_specific_header.clone(),
+                timeout: call.timeout,
+                shaping: call.shaping.clone(),
+            },
+            resolved,
+            secrets.as_ref(),
+        )?;
+        let stream = request.body.get("stream").and_then(Value::as_bool) == Some(true);
+        if stream && request.provider != ANTHROPIC_MESSAGES_PROVIDER {
+            return Err(Error::Unsupported("streaming messages for this provider"));
+        }
+        let context = RequestContext {
+            model: request.model.clone(),
+            custom_llm_provider: request.provider.clone(),
+            optional_params: Value::Object(
+                request
+                    .body
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter(|(name, _)| !matches!(name.as_str(), "model" | "messages"))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            ),
+            secret_fields: Vec::new(),
+            api_key: call.api_key.clone().map(SecretValue::new),
+        };
+        let wire = host
+            .before_send(
+                WireRequest {
+                    url: request.url,
+                    headers: request.upstream_headers,
+                    body: request.body,
+                },
+                context,
+            )
+            .await?;
+        let response = send(&http, &wire.url, &wire.headers, &wire.body, request.timeout).await?;
+        if !response.status().is_success() {
+            let error = provider_error(response).await;
+            if !recovered_thinking
+                && let Some(recovered) =
+                    super::handler::recover_thinking(&error, &request.provider, &wire.body)?
+            {
+                body = recovered;
+                recovered_thinking = true;
+                continue;
+            }
+            return Err(error);
+        }
+        if stream {
+            return relay(&host, response).await;
+        }
+        let text = response.text().await.map_err(network)?;
+        host.emit(MachineEvent::ResponseReceived {
+            raw: RawResponse { body: text.clone() },
+        })
+        .await?;
+        let message = decode_response(request.config, &request.model, &text)?;
+        match host
+            .after_response(MessagesOutput::Message(Box::new(message)))
+            .await?
+        {
+            Verdict::Return(MessagesOutput::Message(message)) if caller_streams => {
+                return super::handler::synthesize(&host, *message).await;
+            }
+            Verdict::Return(response) => return Ok(response),
+            Verdict::Resend(patch) => body = patched(&body, patch),
+        }
     }
-    if stream {
-        return relay(&host, response).await;
-    }
-    let text = response.text().await.map_err(network)?;
-    host.emit(MachineEvent::ResponseReceived {
-        raw: RawResponse { body: text.clone() },
-    })
-    .await?;
-    decode_response(request.config, &request.model, &text)
-        .map(|message| MessagesOutput::Message(Box::new(message)))
+}
+
+fn patched(body: &Map<String, Value>, patch: Map<String, Value>) -> Map<String, Value> {
+    body.iter()
+        .filter(|(name, _)| !patch.contains_key(*name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .chain(
+            patch
+                .iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(name, value)| (name.clone(), value.clone())),
+        )
+        .collect()
 }
 
 /// Hands each upstream chunk to the caller as it arrives. A caller that stops reading
