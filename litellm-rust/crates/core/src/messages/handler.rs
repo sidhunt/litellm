@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use litellm_http::{request::http_request, transport::Error as TransportError};
-use litellm_llms::anthropic::experimental_pass_through::messages::fake_stream_iterator::fake_anthropic_messages_stream;
+use litellm_llms::anthropic::messages::fake_stream_iterator::fake_anthropic_messages_stream;
 use litellm_llms::base_llm::anthropic_messages::transformation::BaseAnthropicMessagesConfig;
 use litellm_types::llms::anthropic_messages::anthropic_response::AnthropicMessagesResponse;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
