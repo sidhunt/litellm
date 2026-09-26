@@ -344,7 +344,6 @@ async fn the_facade_sends_through_the_injected_http_pool_configuration() {
     assert_eq!(sent.header("user-agent"), Some("host-owned/1"));
 }
 
-
 #[rstest]
 #[case::unrelated_bad_request(400, "invalid tool signature", 1)]
 #[case::server_error(500, "invalid thinking signature", 1)]
